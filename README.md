@@ -67,7 +67,8 @@ For other platforms, please use [Vagrantfile](#setting-up-vagrant) that we prepa
 $ sudo apt-get install    \
       pkg-config          \
       libsystemd-dev      \
-      libdbus-glib-1-dev
+      libdbus-glib-1-dev  \
+      libelf-dev
 ```
 
 ### Fedora, Centos, RHEL and related distributions
