@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 
 use super::{
     controller::Controller, controller_type::ControllerType, cpu::Cpu, cpuset::CpuSet,
-    devices::Devices, freezer::Freezer, hugetlb::HugeTlb, io::Io, memory::Memory, pids::Pids,
+    freezer::Freezer, hugetlb::HugeTlb, io::Io, memory::Memory, pids::Pids,
 };
+#[cfg(feature = "cgroupsv2_devices")]
+use super::devices::Devices;
 use crate::common::{self, CgroupManager, PathBufExt};
 use crate::stats::Stats;
 
@@ -238,6 +240,7 @@ impl CgroupManager for SystemDCGroupManager {
             }
         }
 
+        #[cfg(feature = "cgroupsv2_devices")]
         Devices::apply(linux_resources, &self.full_path)?;
         Ok(())
     }

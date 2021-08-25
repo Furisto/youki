@@ -16,7 +16,6 @@ use super::{
     },
     cpu::Cpu,
     cpuset::CpuSet,
-    devices::Devices,
     freezer::Freezer,
     hugetlb::HugeTlb,
     io::Io,
@@ -24,6 +23,8 @@ use super::{
     pids::Pids,
     unified::Unified,
 };
+#[cfg(feature = "cgroupsv2_devices")]
+use super::devices::Devices;
 use crate::{
     common::{self, CgroupManager, PathBufExt, CGROUP_PROCS},
     stats::{Stats, StatsProvider},
@@ -134,16 +135,17 @@ impl CgroupManager for Manager {
             }
         }
 
+        #[cfg(feature = "cgroupsv2_devices")]
+        Devices::apply(linux_resources, &self.cgroup_path)?;
+
         for pseudoctlr in PSEUDO_CONTROLLER_TYPES {
             match pseudoctlr {
-                PseudoControllerType::Devices => {
-                    Devices::apply(linux_resources, &self.cgroup_path)?
-                }
                 PseudoControllerType::Unified => Unified::apply(
                     linux_resources,
                     &self.cgroup_path,
                     self.get_available_controllers()?,
                 )?,
+                _ => {}
             }
         }
 
