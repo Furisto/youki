@@ -18,10 +18,10 @@ use oci_spec::runtime::{
     Linux, LinuxDevice, LinuxDeviceBuilder, LinuxDeviceType, Mount, MountBuilder, Spec,
 };
 use procfs::process::{MountInfo, MountOptFields, Process};
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::fs::{canonicalize, create_dir_all, remove_file};
-use std::ops::Deref;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
@@ -158,14 +158,21 @@ fn mount_cgroup_v1(cgroup_mount: &Mount, options: &MountOptions) -> Result<()> {
     // setup cgroup mounts for container
     for host_mount in &host_mounts {
         if let Some(subsystem_name) = host_mount.file_name().and_then(|n| n.to_str()) {
-            if subsystem_name == "systemd" {
-                continue;
-            }
-
             if options.cgroup_ns {
-                setup_namespaced_subsystem(cgroup_mount, options, subsystem_name)?;
+                setup_namespaced_subsystem(
+                    cgroup_mount,
+                    options,
+                    subsystem_name,
+                    subsystem_name == "systemd",
+                )?;
             } else {
-                setup_emulated_subsystem(cgroup_mount, options, host_mount, subsystem_name)?;
+                setup_emulated_subsystem(
+                    cgroup_mount,
+                    options,
+                    host_mount,
+                    subsystem_name,
+                    subsystem_name == "systemd",
+                )?;
             }
 
             setup_comount_symlinks(&cgroup_root, subsystem_name)?;
@@ -183,6 +190,7 @@ fn setup_namespaced_subsystem(
     cgroup_mount: &Mount,
     options: &MountOptions,
     subsystem_name: &str,
+    named: bool,
 ) -> Result<()> {
     let subsystem_mount = MountBuilder::default()
         .source("cgroup")
@@ -197,12 +205,18 @@ fn setup_namespaced_subsystem(
         .build()
         .with_context(|| format!("failed to build {}", subsystem_name))?;
 
+    let data: Cow<str> = if named {
+        format!("name={}", subsystem_name).into()
+    } else {
+        subsystem_name.into()
+    };
+
     log::debug!("Mounting cgroup subsystem: {:?}", subsystem_name);
     mount_to_container(
         &subsystem_mount,
         options.root,
         MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-        subsystem_name,
+        &data,
         options.label,
     )
     .with_context(|| format!("failed to mount {:?}", subsystem_mount))
@@ -228,6 +242,7 @@ fn setup_emulated_subsystem(
     options: &MountOptions,
     host_mount: &Path,
     subsystem_name: &str,
+    named: bool,
 ) -> Result<()> {
     let process_cgroups: HashMap<String, String> = Process::myself()?
         .cgroups()
@@ -236,8 +251,14 @@ fn setup_emulated_subsystem(
         .map(|c| (c.controllers.join(","), c.pathname))
         .collect();
 
+    let named_hierarchy: Cow<str> = if named {
+        format!("name={}", subsystem_name).into()
+    } else {
+        subsystem_name.into()
+    };
+
     log::debug!("{:?}", process_cgroups);
-    if let Some(proc_path) = process_cgroups.get(subsystem_name) {
+    if let Some(proc_path) = process_cgroups.get(named_hierarchy.as_ref()) {
         let emulated = MountBuilder::default()
             .source(
                 host_mount
