@@ -4,6 +4,7 @@
 use crate::utils::PathBufExt;
 use anyhow::{anyhow, bail, Context, Result};
 use cgroups::common::CgroupSetup::{Hybrid, Legacy, Unified};
+use cgroups::common::DEFAULT_CGROUP_ROOT;
 use nix::errno::Errno;
 use nix::fcntl::{open, OFlag};
 use nix::mount::mount as nix_mount;
@@ -17,8 +18,10 @@ use oci_spec::runtime::{
     Linux, LinuxDevice, LinuxDeviceBuilder, LinuxDeviceType, Mount, MountBuilder, Spec,
 };
 use procfs::process::{MountInfo, MountOptFields, Process};
-use std::fs::OpenOptions;
+use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
 use std::fs::{canonicalize, create_dir_all, remove_file};
+use std::ops::Deref;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
@@ -68,6 +71,7 @@ pub fn prepare_rootfs(
 
     if let Some(mounts) = spec.mounts() {
         for mount in mounts {
+            log::debug!("{:#?}", mount);
             setup_mount(mount, &global_options)
                 .with_context(|| format!("failed to setup mount {:#?}", mount))?;
         }
@@ -122,12 +126,12 @@ fn setup_mount(mount: &Mount, options: &MountOptions) -> Result<()> {
     Ok(())
 }
 
-fn mount_cgroup_v1(mount: &Mount, options: &MountOptions) -> Result<()> {
+fn mount_cgroup_v1(cgroup_mount: &Mount, options: &MountOptions) -> Result<()> {
     // create tmpfs into which the cgroup subsystems will be mounted
     let tmpfs = MountBuilder::default()
         .source("tmpfs")
         .typ("tmpfs")
-        .destination(mount.destination())
+        .destination(cgroup_mount.destination())
         .options(
             ["noexec", "nosuid", "nodev", "mode=755"]
                 .iter()
@@ -140,45 +144,33 @@ fn mount_cgroup_v1(mount: &Mount, options: &MountOptions) -> Result<()> {
     setup_mount(&tmpfs, options).context("failed to mount tmpfs for cgroup")?;
 
     // get all cgroup mounts on the host system
-    let mount_points: Vec<PathBuf> = cgroups::v1::util::list_subsystem_mount_points()
+    let host_mounts: Vec<PathBuf> = cgroups::v1::util::list_subsystem_mount_points()
         .context("failed to get subsystem mount points")?
         .into_iter()
-        .filter(|p| p.as_path().starts_with("/sys/fs"))
+        .filter(|p| p.as_path().starts_with(DEFAULT_CGROUP_ROOT))
         .collect();
-    log::debug!("{:?}", mount_points);
 
-    // setup cgroup mounts for container
     let cgroup_root = options
         .root
-        .join_safely(mount.destination())
-        .context("could not join rootfs with cgroup destination")?;
-    for mount_point in mount_points {
-        if let Some(subsystem_name) = mount_point.file_name().and_then(|n| n.to_str()) {
-            let cgroup_mount = MountBuilder::default()
-                .source("cgroup")
-                .typ("cgroup")
-                .destination(mount.destination().join(subsystem_name))
-                .options(
-                    ["noexec", "nosuid", "nodev"]
-                        .iter()
-                        .map(|o| o.to_string())
-                        .collect::<Vec<String>>(),
-                )
-                .build()
-                .with_context(|| format!("failed to build {}", subsystem_name))?;
+        .join_safely(cgroup_mount.destination())
+        .context("could not join rootfs path with cgroup mount destination")?;
 
+    // setup cgroup mounts for container
+    for host_mount in &host_mounts {
+        if let Some(subsystem_name) = host_mount.file_name().and_then(|n| n.to_str()) {
             if subsystem_name == "systemd" {
                 continue;
             }
 
             if options.cgroup_ns {
-                setup_namespaced_hierarchy(&cgroup_mount, options, subsystem_name)?;
-                setup_comount_symlinks(&cgroup_root, subsystem_name)?;
+                setup_namespaced_subsystem(cgroup_mount, options, subsystem_name)?;
             } else {
-                log::warn!("cgroup mounts are currently only suported with cgroup namespaces")
+                setup_emulated_subsystem(cgroup_mount, options, host_mount, subsystem_name)?;
             }
+
+            setup_comount_symlinks(&cgroup_root, subsystem_name)?;
         } else {
-            log::warn!("could not get subsystem name from {:?}", mount_point);
+            log::warn!("could not get subsystem name from {:?}", host_mount);
         }
     }
 
@@ -187,20 +179,33 @@ fn mount_cgroup_v1(mount: &Mount, options: &MountOptions) -> Result<()> {
 
 // On some distros cgroup subsystems are comounted e.g. cpu,cpuacct or net_cls,net_prio. These systems
 // have to be comounted in the container as well as the kernel will reject trying to mount them separately.
-fn setup_namespaced_hierarchy(
+fn setup_namespaced_subsystem(
     cgroup_mount: &Mount,
     options: &MountOptions,
     subsystem_name: &str,
 ) -> Result<()> {
+    let subsystem_mount = MountBuilder::default()
+        .source("cgroup")
+        .typ("cgroup")
+        .destination(cgroup_mount.destination().join(subsystem_name))
+        .options(
+            ["noexec", "nosuid", "nodev"]
+                .iter()
+                .map(|o| o.to_string())
+                .collect::<Vec<String>>(),
+        )
+        .build()
+        .with_context(|| format!("failed to build {}", subsystem_name))?;
+
     log::debug!("Mounting cgroup subsystem: {:?}", subsystem_name);
     mount_to_container(
-        cgroup_mount,
+        &subsystem_mount,
         options.root,
         MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
         subsystem_name,
         options.label,
     )
-    .with_context(|| format!("failed to mount {:?}", cgroup_mount))
+    .with_context(|| format!("failed to mount {:?}", subsystem_mount))
 }
 
 // Create symlinks for subsystems that have been comounted e.g. cpu -> cpu,cpuacct, cpuacct -> cpu,cpuacct
@@ -213,6 +218,60 @@ fn setup_comount_symlinks(cgroup_root: &Path, subsystem_name: &str) -> Result<()
         let link = cgroup_root.join(comount);
         symlink(subsystem_name, &link)
             .with_context(|| format!("failed to symlink {:?} to {:?}", link, subsystem_name))?;
+    }
+
+    Ok(())
+}
+
+fn setup_emulated_subsystem(
+    mount: &Mount,
+    options: &MountOptions,
+    host_mount: &Path,
+    subsystem_name: &str,
+) -> Result<()> {
+    let process_cgroups: HashMap<String, String> = Process::myself()?
+        .cgroups()
+        .context("failed to get process cgroups")?
+        .into_iter()
+        .map(|c| (c.controllers.join(","), c.pathname))
+        .collect();
+
+    log::debug!("{:?}", process_cgroups);
+    if let Some(proc_path) = process_cgroups.get(subsystem_name) {
+        let emulated = MountBuilder::default()
+            .source(
+                host_mount
+                    .join_safely(proc_path.as_str())
+                    .with_context(|| {
+                        format!(
+                            "failed to join mount source for {} subsystem",
+                            subsystem_name
+                        )
+                    })?,
+            )
+            .destination(
+                mount
+                    .destination()
+                    .join_safely(subsystem_name)
+                    .with_context(|| {
+                        format!(
+                            "failed to join mount destination for {} subsystem",
+                            subsystem_name
+                        )
+                    })?,
+            )
+            .typ("bind")
+            .options(
+                ["rw", "rbind"]
+                    .iter()
+                    .map(|o| o.to_string())
+                    .collect::<Vec<String>>(),
+            )
+            .build()?;
+        log::debug!("Mounting emulated cgroup subsystem: {:?}", emulated);
+
+        setup_mount(&emulated, options)
+            .with_context(|| format!("failed to mount {} cgroup hierarchy", subsystem_name))?;
     }
 
     Ok(())
@@ -427,7 +486,7 @@ fn mount_to_container(
             Path::new(&dest)
         };
         create_dir_all(&dir)
-            .with_context(|| format!("Failed to create dir for bind mount: {:?}", dir))?;
+            .with_context(|| format!("failed to create dir for bind mount: {:?}", dir))?;
         if src.is_file() {
             OpenOptions::new()
                 .create(true)
@@ -438,7 +497,7 @@ fn mount_to_container(
 
         src
     } else {
-        create_dir_all(&dest).with_context(|| format!("Failed to create device: {:?}", dest))?;
+        create_dir_all(&dest).with_context(|| format!("failed to create device: {:?}", dest))?;
         PathBuf::from(source)
     };
 
