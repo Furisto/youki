@@ -149,11 +149,21 @@ fn mount_cgroup_v1(cgroup_mount: &Mount, options: &MountOptions) -> Result<()> {
         .into_iter()
         .filter(|p| p.as_path().starts_with(DEFAULT_CGROUP_ROOT))
         .collect();
+    log::debug!("Cgroup mounts: {:?}", host_mounts);
+
+    let process_cgroups: HashMap<String, String> = Process::myself()?
+        .cgroups()
+        .context("failed to get process cgroups")?
+        .into_iter()
+        .map(|c| (c.controllers.join(","), c.pathname))
+        .collect();
+    log::debug!("Process cgroups: {:?}", process_cgroups);
 
     let cgroup_root = options
         .root
         .join_safely(cgroup_mount.destination())
         .context("could not join rootfs path with cgroup mount destination")?;
+    log::debug!("Cgroup root: {:?}", cgroup_root);
 
     // setup cgroup mounts for container
     for host_mount in &host_mounts {
@@ -169,9 +179,10 @@ fn mount_cgroup_v1(cgroup_mount: &Mount, options: &MountOptions) -> Result<()> {
                 setup_emulated_subsystem(
                     cgroup_mount,
                     options,
-                    host_mount,
                     subsystem_name,
                     subsystem_name == "systemd",
+                    host_mount,
+                    &process_cgroups,
                 )?;
             }
 
@@ -192,6 +203,10 @@ fn setup_namespaced_subsystem(
     subsystem_name: &str,
     named: bool,
 ) -> Result<()> {
+    log::debug!(
+        "Mounting (namespaced) {:?} cgroup subsystem",
+        subsystem_name
+    );
     let subsystem_mount = MountBuilder::default()
         .source("cgroup")
         .typ("cgroup")
@@ -211,7 +226,6 @@ fn setup_namespaced_subsystem(
         subsystem_name.into()
     };
 
-    log::debug!("Mounting cgroup subsystem: {:?}", subsystem_name);
     mount_to_container(
         &subsystem_mount,
         options.root,
@@ -238,26 +252,20 @@ fn setup_comount_symlinks(cgroup_root: &Path, subsystem_name: &str) -> Result<()
 }
 
 fn setup_emulated_subsystem(
-    mount: &Mount,
+    cgroup_mount: &Mount,
     options: &MountOptions,
-    host_mount: &Path,
     subsystem_name: &str,
     named: bool,
+    host_mount: &Path,
+    process_cgroups: &HashMap<String, String>,
 ) -> Result<()> {
-    let process_cgroups: HashMap<String, String> = Process::myself()?
-        .cgroups()
-        .context("failed to get process cgroups")?
-        .into_iter()
-        .map(|c| (c.controllers.join(","), c.pathname))
-        .collect();
-
+    log::debug!("Mounting (emulated) {:?} cgroup subsystem", subsystem_name);
     let named_hierarchy: Cow<str> = if named {
         format!("name={}", subsystem_name).into()
     } else {
         subsystem_name.into()
     };
 
-    log::debug!("{:?}", process_cgroups);
     if let Some(proc_path) = process_cgroups.get(named_hierarchy.as_ref()) {
         let emulated = MountBuilder::default()
             .source(
@@ -271,7 +279,7 @@ fn setup_emulated_subsystem(
                     })?,
             )
             .destination(
-                mount
+                cgroup_mount
                     .destination()
                     .join_safely(subsystem_name)
                     .with_context(|| {
@@ -293,6 +301,8 @@ fn setup_emulated_subsystem(
 
         setup_mount(&emulated, options)
             .with_context(|| format!("failed to mount {} cgroup hierarchy", subsystem_name))?;
+    } else {
+        log::warn!("Could not mount {:?} cgroup subsystem", subsystem_name);
     }
 
     Ok(())
