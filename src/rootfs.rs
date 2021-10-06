@@ -534,7 +534,7 @@ fn mount_to_container(
 
     if let Err(errno) = nix_mount(Some(&*src), dest, typ, flags, Some(&*d)) {
         if !matches!(errno, Errno::EINVAL) {
-            bail!("mount of {:?} failed. {}", m.destination(), errno);
+            bail!("mount of {:?} failed. {}", dest, errno);
         }
         nix_mount(Some(&*src), dest, typ, flags, Some(data))?;
     }
@@ -671,6 +671,11 @@ mod tests {
     use anyhow::{Context, Result};
     use procfs::process::MountInfo;
     use std::path::{Path, PathBuf};
+    use std::fs;
+
+    use crate::utils::create_temp_dir;
+
+    use super::setup_comount_symlinks;
 
     #[test]
     fn test_find_parent_mount() -> Result<()> {
@@ -712,5 +717,58 @@ mod tests {
         let mount_infos = vec![];
         let res = super::find_parent_mount(Path::new("/path/to/rootfs"), &mount_infos);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn setup_comounted_symlinks_success() -> Result<()> {
+        // arrange
+        let tmp = create_temp_dir("setup_comounted_symlinks_success")?;
+        let cpu = tmp.join("cpu");
+        let cpuacct = tmp.join("cpuacct");
+        let cpu_cpuacct = tmp.join("cpu,cpuacct");
+        fs::create_dir_all(&cpu_cpuacct)?;
+
+        // act
+        setup_comount_symlinks(&tmp, "cpu,cpuacct").context("failed to setup symlinks")?;
+
+        // assert
+        assert!(cpu.exists(), "cpu symlink does not exist");
+        assert!(cpuacct.exists(), "cpuacct symlink does not exist");
+
+        assert!(
+            fs::symlink_metadata(&cpu)?.file_type().is_symlink(),
+            "cpu is not a symlink"
+        );
+        assert!(
+            fs::symlink_metadata(&cpuacct)?.file_type().is_symlink(),
+            "cpuacct is not a symlink"
+        );
+
+        assert_eq!(
+            fs::read_link(cpu)?,
+            PathBuf::from("cpu,cpuacct"),
+            "cpu does not link to cpu,cpuacct"
+        );
+        assert_eq!(
+            fs::read_link(cpuacct)?,
+            PathBuf::from("cpu,cpuacct"),
+            "cpuacct does not link to cpu,cpuacct"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn setup_comounted_symlinks_no_comounts() -> Result<()> {
+        // arrange
+        let tmp = create_temp_dir("setup_comounted_symlinks_no_comounts")?;
+
+        // act
+        let result =
+            setup_comount_symlinks(&tmp, "memory,task").context("failed to setup symlinks");
+
+        // assert
+        assert!(result.is_ok());
+        Ok(())
     }
 }
